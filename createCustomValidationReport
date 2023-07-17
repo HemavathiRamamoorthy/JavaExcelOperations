@@ -127,7 +127,7 @@ private void createCustomValidationReport(String objectName,String[] queryList,S
 	       // int minute = currentTime.getMinute();
 	        
 	       // String dateTime=formattedDate+"_"+hour+"_"+minute;
-			String fileName="C:\\AMW_HOME\\Download\\ValidationReport_"+queryList[0]+"_"+formattedDate+".xlsx";
+			String fileName="C:\\HOME\\Download\\ValidationReport_"+queryList[0]+"_"+formattedDate+".xlsx";
 			SourceReportDetails srcReport =  writeResultSetToCSV(injResultSet,sheetName,fileName);
 			
 			ConnectionUtils.closeConnection(injResultSet, statement, null);
