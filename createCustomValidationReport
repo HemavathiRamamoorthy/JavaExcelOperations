@@ -1,0 +1,533 @@
+package com.hema.report.service;
+import java.io.BufferedWriter;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
+
+import javax.servlet.http.HttpSession;
+
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.BasicResponseHandler;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.FillPatternType;
+import org.apache.poi.ss.usermodel.IndexedColors;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+private void createCustomValidationReport(String objectName,String[] queryList,String profileName,String profilePath,HttpSession session)  {
+		// step 1 : Get Injection table names associated with selected query
+		FileOperationServiceImpl fileOps = new FileOperationServiceImpl();
+		Connection conn=null;
+		String targetTable = "";
+		try {
+		Object jsonObj = fileOps.readProfile(profilePath, profileName);
+		Gson gson = new GsonBuilder().setPrettyPrinting().create();
+	
+			CreateProfile profile = gson.fromJson(jsonObj.toString(), CreateProfile.class);
+			List<String> injectionTableList=new ArrayList<>();
+			List<String> queries =  Arrays.asList(queryList);
+			Map<String,String> sourceToTarget =  new LinkedHashMap<>();
+			if(null!=profile.getTables().getInjection().getTableINJOBJMetadata())
+			{
+				List<TableINJOBJMetadata> injectionTableObjMetadata =  profile.getTables().getInjection().getTableINJOBJMetadata();
+				for(TableINJOBJMetadata objMetadata:injectionTableObjMetadata)
+				{
+					if(queries.contains(objMetadata.getQueryIdentifier())) {
+						injectionTableList.add(objMetadata.getTableName());
+					}
+				}
+				List<Property> profileProperty = profile.getProperties().getProperties();
+				for(Property profProperty:profileProperty)
+				{
+					if(injectionTableList.contains(profProperty.getInjMetadataTableName())){
+						
+						sourceToTarget.put(profProperty.getMapping().get(0).getTargetAttr().replace("\n", "").replace("\t", ""), profProperty.getMapping().get(0).getSourceAttr());
+					}
+				}
+			}
+	        String tableNames = String.join(",", injectionTableList);
+
+			//step 2: select all records by joining all tables also check whether its objectName is provided objectName
+            conn=ConnectionUtils.getDBConnection();
+			CallableStatement statement = conn.prepareCall("{call GetRecordsByObjectname(?, ?)}");
+            statement.setString(1, tableNames);	
+            statement.setString(2, objectName);
+
+            // Execute the stored procedure
+            statement.execute();
+
+            // Retrieve the result set
+            ResultSet injResultSet = statement.getResultSet();
+
+             statement = conn.prepareCall("{call GetTableCounts(?, ?)}");
+            statement.setString(1, tableNames);	
+            statement.setString(2, objectName);
+            statement.execute();
+
+            // Retrieve the result set
+            ResultSet countsResultSet = statement.getResultSet();
+            HashMap<String,Integer> resultHashMap = new LinkedHashMap<>();
+            int successCount = 0, failureCount = 0;
+            while(countsResultSet.next())
+            {
+            	successCount=countsResultSet.getInt("SuccessCount");
+            	failureCount=countsResultSet.getInt("FailureCount");
+            }
+            resultHashMap.put("SuccessCount", successCount);
+        	resultHashMap.put("FailureCount", failureCount);
+			//step 3: write that to csv file
+			String sheetName = objectName;
+			// Get current date
+	        LocalDate currentDate = LocalDate.now();
+	        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("ddMMMyyyy");
+	        String formattedDate = currentDate.format(formatter);
+	        //LocalTime currentTime = LocalTime.now();
+	       // int hour = currentTime.getHour();
+	       // int minute = currentTime.getMinute();
+	        
+	       // String dateTime=formattedDate+"_"+hour+"_"+minute;
+			String fileName="C:\\AMW_HOME\\Download\\ValidationReport_"+queryList[0]+"_"+formattedDate+".xlsx";
+			SourceReportDetails srcReport =  writeResultSetToCSV(injResultSet,sheetName,fileName);
+			
+			ConnectionUtils.closeConnection(injResultSet, statement, null);
+			// get details from target 
+			//form query for vault
+			int targetObjIdSize= srcReport.getTargetObjectIds().size();
+			int batchSize =800;
+			int batch = 1;
+			if(targetObjIdSize>batchSize) {
+				batch= (targetObjIdSize/batchSize)+1;
+			}
+			int currentBatch = 1;
+			int rowId = 0;
+			List<String> vaultColumnList = srcReport.getColumnNames();
+			vaultColumnList.remove("ID");
+			vaultColumnList.remove("id");
+			List<String> vaultUniqueColumnList = new ArrayList<>();
+			vaultUniqueColumnList = vaultColumnList.stream()
+					.distinct()
+					.collect(Collectors.toList());
+			targetTable = getReportTableName(profileName, queryList[0], formattedDate);
+
+			List<String> longColumnList =  getLongTextFields(objectName,conn);
+			List<String> finalColumnList = vaultUniqueColumnList.stream()
+					.map(column -> column.contains(".") ? "[" + column + "]" : column)
+					.collect(Collectors.toList());
+			if(TableUtility.tableDoesNotExist(targetTable)) {
+			while(currentBatch<=batch) {
+				String queryForTargetVault ="";
+				StringBuilder vaultQuery =  new StringBuilder("select ");
+
+				vaultQuery.append(String.join(", ", vaultUniqueColumnList));
+				vaultQuery.append(" from ");
+				vaultQuery.append(objectName);
+				vaultQuery.append(" where id CONTAINS  (");
+				int maxBatchSize = currentBatch*batchSize;
+				maxBatchSize=Math.min(maxBatchSize, targetObjIdSize);
+				for (int i=rowId;i<maxBatchSize;i++) {
+					String columnName = srcReport.getTargetObjectIds().get(i);
+					if(null!=columnName && !"".equals(columnName)) {
+						vaultQuery.append("'").append(columnName).append("',");
+					}
+					rowId++;
+				}
+
+				vaultQuery.append(")");
+				queryForTargetVault = vaultQuery.toString().replace(",)",")");	
+				queryForTargetVault = queryForTargetVault.replace(".","r.");
+				queryForTargetVault = queryForTargetVault.replace("target_obj_id", "id");
+				for(String longColumn:longColumnList)
+				{
+					queryForTargetVault = queryForTargetVault.replace(longColumn, "LONGTEXT("+longColumn+")");
+				}
+
+				log.info("queryForTargetVault vql :: " +queryForTargetVault);
+				ExtractionServiceImpl exImpl =  new ExtractionServiceImpl();
+				exImpl.extractTargetMetadata(queryForTargetVault, profileName, "queryName", "userId", profilePath,session,objectName,targetTable);
+				currentBatch++;
+			}
+			}
+				StringBuilder targetQuery=new StringBuilder("select ");
+				targetQuery.append(String.join(", ", finalColumnList));
+				targetQuery.append(" from ");
+				targetQuery.append(targetTable);
+				targetQuery.append(" order by id");
+				//exImpl.extractPickList(profileName, queryList[0], "admin", profilePath, session);
+				Statement stmt = conn.createStatement();
+				ResultSet targetRecordList =  stmt.executeQuery(targetQuery.toString().replace("target_obj_id", "id"));
+				appendDataToExcelSheet(targetRecordList,sheetName,fileName,getPickListValues(finalColumnList,conn),resultHashMap,getDefaultValues(finalColumnList, conn),getMultiValueColumns(finalColumnList, conn),rowId,longColumnList);
+				
+			writeCountToExcel(fileName, "Count", resultHashMap);
+			
+			session.setAttribute("ReportStatus", "Report Downloaded successfully \n" + fileName);
+		}catch(Exception ex)
+		{
+			log.error("Exception in createCustomValidationReport : "+ex.getMessage());
+			session.setAttribute("ReportStatus", "Error while Downloading report");
+		}finally {
+			if(!("").equals(targetTable)) {
+			//	TableUtility.dropTable(targetTable);
+			}
+			ConnectionUtils.closeConnection(conn);
+		}
+
+	}
+
+	 private  SourceReportDetails  writeResultSetToCSV(ResultSet resultSet,String sheetName, String fileName) throws SQLException, IOException {
+		 SourceReportDetails srcReport =  new SourceReportDetails();
+		 List<String> targetObjectIds  =  new ArrayList<>();
+		 List<String> columnNames =  new ArrayList<>();
+	        XSSFWorkbook workbook = new XSSFWorkbook();
+	        XSSFSheet sheet = workbook.createSheet(sheetName);
+
+	        ResultSetMetaData metaData = resultSet.getMetaData();
+	        int columnCount = metaData.getColumnCount();
+	     int targetObjIdColumnNumber=0;
+	      
+	       List<String> columnToRemove = Arrays.asList("batchId","objectName","rowid","csvcreated","injstatus","errordesc","id","ID");
+	     //  columnToRemove.add((new VmigProperties()).getRdbmsUniqueObjKey());
+	       List<Integer> columnIndexNotToDisplay=new ArrayList<>(); 
+	       // Write column name
+	        Row headerRow = sheet.createRow(0);
+	        int j=0;
+	        CellStyle cellStyle = workbook.createCellStyle();
+	        cellStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+	        cellStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+	        
+	       
+	        for (int i = 1; i <= columnCount; i++) {
+	            String columnName = metaData.getColumnName(i);
+	            
+	            if(columnName.equalsIgnoreCase("target_obj_id")) {
+	            	targetObjIdColumnNumber=i;
+	            }
+	            if(columnToRemove.contains(columnName))
+	            {
+	            	columnIndexNotToDisplay.add(i);
+	            }else {
+	            	Cell cell = headerRow.createCell(j);
+	            	 cell.setCellValue(columnName);
+	            	 cell.setCellStyle(cellStyle);
+	            	 j++;
+	            }
+	            columnNames.add(columnName);
+	        }
+	        
+	        // Write data rows
+	        int rowNum = 1;   
+	        while (resultSet.next()) {
+	            Row dataRow = sheet.createRow(rowNum);
+	            j=0;
+	            for (int i = 1; i <= columnCount; i++) {
+	                Object value = resultSet.getObject(i);
+	               
+	                String strValue =(value!=null)?String.valueOf(value):"";
+	                if(targetObjIdColumnNumber==i) {
+	                	targetObjectIds.add(strValue);
+	                }
+	                if(!columnIndexNotToDisplay.contains(i)) {
+	                	 Cell cell = dataRow.createCell(j);
+	                	cell.setCellValue(strValue.trim());
+	                	j++;
+	                }
+	            }
+	            rowNum++;
+	        }
+
+	        // Auto-size columns
+	        for (int i = 0; i < columnCount; i++) {
+	            sheet.autoSizeColumn(i);
+	        }
+
+	        // Save workbook to file
+	        FileOutputStream fileOutputStream = new FileOutputStream(fileName);
+	        workbook.write(fileOutputStream);
+	        fileOutputStream.close();
+
+	        workbook.close();
+	        columnNames.removeAll(columnToRemove);
+	        srcReport.setColumnNames(columnNames);
+	        srcReport.setTargetObjectIds(targetObjectIds);
+	        return srcReport;
+	    }
+	 private  void appendDataToExcelSheet(ResultSet resultSet, String sheetName, String filePath,Map<String,Map<String,String>> pickListObject, HashMap<String, Integer> resultHashMap,Map<String,String> defaultValues, Map<String, String> multiValueColumn, int rowId,List longColumnList) { 
+		 try (FileInputStream file = new FileInputStream(filePath);
+             Workbook workbook = new XSSFWorkbook(file)) {
+		 
+		 	int matchCount=0;
+		 	int mismatchCount=0;
+            Sheet sheet = workbook.getSheet(sheetName);
+            ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
+            
+            int rowCount =0;
+            int columnCount = resultSetMetaData.getColumnCount();
+      //      Map<Integer,String> pickListColumn=new LinkedHashMap<>();
+            Map<Integer,String> indexToColumn=new LinkedHashMap<>();
+            Row headerRow = sheet.getRow(0);
+            int startColumn = headerRow.getLastCellNum();
+            CellStyle cellStyle = workbook.createCellStyle();
+	        cellStyle.setFillForegroundColor(IndexedColors.LIGHT_ORANGE.getIndex());
+	        cellStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+	        
+	        CellStyle cellStyleMatch = workbook.createCellStyle();
+	        cellStyleMatch.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+	        cellStyleMatch.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            for (int i = 1; i <= columnCount; i++) {
+            	 int currentColumnNumber = startColumn+i-1;
+            	Cell existingHeader =  headerRow.getCell(i-1);
+	            String columnName = resultSetMetaData.getColumnName(i);
+//	            if(pickListObject.keySet().contains(columnName)) {
+//            		pickListColumn.put(currentColumnNumber,columnName);
+//            	}
+	            indexToColumn.put(currentColumnNumber, columnName);
+	            		Cell cell = headerRow.createCell(currentColumnNumber);
+	            		cell.setCellValue(columnName);
+	            		cell.setCellStyle(cellStyle);
+	            		Cell comparisonCell = headerRow.createCell(currentColumnNumber + columnCount);
+	                    comparisonCell.setCellValue(existingHeader+":"+columnName);
+	                    comparisonCell.setCellStyle(cellStyleMatch);
+	                    if(i==columnCount)
+                        {
+                        	 Cell lastCell = headerRow.createCell(startColumn + columnCount + i );
+                        	 lastCell.setCellValue("Result");
+                        }
+	        }
+            Row dataRow =null;
+            while (resultSet.next()) {
+            	String idFromVault =  resultSet.getString("id");
+            	
+            	 String finalResult="Match";
+                 dataRow = sheet.getRow(++rowCount);
+                 Cell targetVaultIdCell = dataRow.getCell(startColumn-1);
+                 String targtVaultId= targetVaultIdCell.getStringCellValue();
+                 if(!idFromVault.equalsIgnoreCase(targtVaultId))
+                 {
+                	   dataRow = sheet.getRow(++rowCount);
+                 }
+                for (int i = 1; i <= columnCount; i++) {
+                	int currentColumnNumber = startColumn + i - 1;
+                
+                    Cell cell = dataRow.createCell(currentColumnNumber);
+                    String tempValue = resultSet.getString(i) ; 
+                    String colName = indexToColumn.get(currentColumnNumber);
+                    String newValue =""; String existingValue ="";
+                    Cell existingCell = dataRow.getCell(i - 1);
+                    if (existingCell != null && existingCell.getCellType() == CellType.STRING) {
+                         existingValue = existingCell.getStringCellValue();
+                    }
+                    if(longColumnList.contains(colName) || existingValue.equalsIgnoreCase(tempValue) || (existingValue.indexOf("[")==0 && existingValue.indexOf("]")==existingValue.length()-1) ){
+                    	newValue =tempValue;
+                    }else {
+                    	newValue = (tempValue.indexOf("[")==0 && tempValue.indexOf("]")==tempValue.length()-1)? tempValue.replace("[", "").replace("]", ""):tempValue;
+                    } StringBuilder multiValue = new StringBuilder();
+                    	
+                    	newValue=getPickListLabel(colName, newValue, pickListObject);
+                    	if(multiValueColumn.containsKey(colName) ){
+                    		String delimiter = multiValueColumn.get(colName);
+                    		if(newValue.contains(delimiter)) {
+                    			String[] splitNewVal =  newValue.split(delimiter);
+                    			for(String tempVal : splitNewVal)
+                    			{
+                    				multiValue.append(getPickListLabel(colName, tempVal.trim(), pickListObject) +delimiter);
+                    			}
+                    			newValue = multiValue.deleteCharAt(multiValue.lastIndexOf(delimiter)).toString();
+                    		}
+                    	}
+
+                    	cell.setCellValue(newValue);
+                    // Compare with existing value
+                   
+                    boolean isDefaultValue = false;
+                    
+                        if(existingValue.equals("") &&  null!=defaultValues.get(colName)) {
+                        	existingValue = defaultValues.get(colName);
+                        	isDefaultValue=true;
+                        }
+                        String comparisonResult = (existingValue.trim().replace("\r", "").replace("\n", "").replace(" ", "").replace("?","").replace("�", "").equals(newValue.trim().replace("\r", "").replace("\n", "").replace(" ", "").replace("?","").replace("�", ""))) ? "Match" : "Mismatch";
+                        if(finalResult.equals("Match") &&  comparisonResult.equals("Match"))
+                        {
+                        	finalResult="Match";
+                        }else {
+                        	finalResult="Mismatch";
+                        }
+                        // Write comparison result to next column
+                        Cell comparisonCell = dataRow.createCell(startColumn + columnCount + i - 1);
+                        comparisonCell.setCellValue(comparisonResult);
+//                        String a = CellReference.convertNumToColString(existingCell.getColumnIndex()) + (dataRow.getRowNum() + 1);
+//                        String b= CellReference.convertNumToColString(cell.getColumnIndex()) + (dataRow.getRowNum() + 1);
+//                        if(isDefaultValue) {
+//                        	comparisonCell.setCellValue(comparisonResult);
+//                        }else {
+//                        	comparisonCell.setCellFormula("IF(SUBSTITUTE(SUBSTITUTE("+a+",\" \",\"\"), CHAR(13), \"\")=SUBSTITUTE(SUBSTITUTE("+b+",\" \",\"\"),  CHAR(13), \"\"),\"Match\",\"MisMatch\")");
+//                        }
+                        if(i==columnCount)
+                        {
+                        	 Cell lastCell = dataRow.createCell(startColumn + columnCount + i );
+                        	 lastCell.setCellValue(finalResult);
+                        	 
+                        	 if(finalResult.equalsIgnoreCase("Match")) 
+                        	 {
+                        		 matchCount++;
+                        	 }else{
+                        		 mismatchCount++;
+                        	 }
+                        }
+                    
+                }
+            }
+            resultHashMap.put("MatchCount", matchCount);
+            resultHashMap.put("MismatchCount", mismatchCount);
+            try (FileOutputStream outputStream = new FileOutputStream(filePath)) {
+                workbook.write(outputStream);
+            }
+        } catch (Exception e) {
+          log.error("Exception in appendDataToExcelSheet"+e.getMessage());
+        }
+	 }
+
+	   private Map<String,Map<String,String>> getPickListValues(List<String> columnNames,Connection con) throws SQLException {
+		  Statement stmt=con.createStatement();
+		  ResultSet rs=null;
+		  Map<String,Map<String,String>> pickListObjects =  new LinkedHashMap<>();
+		  for(String columnName:columnNames) {
+			  String query="select picklistName,picklistValueName,label from PICKLIST where picklistName='"+columnName+"'";
+			  rs=stmt.executeQuery(query);
+			 
+			  Map<String,String> pickListMap=new LinkedHashMap<>();
+			  String pickListName = "";
+			  while(rs.next()) {
+				  pickListName = rs.getString("picklistName");
+				  pickListMap.put(rs.getString("picklistValueName"), rs.getString("label"));
+			  }
+			  pickListObjects.put(pickListName, pickListMap);
+		  }
+		  ConnectionUtils.closeResultSet(rs);
+		  ConnectionUtils.closeStatement(stmt);
+		  return pickListObjects;
+	   }
+	   public  void writeCountToExcel(String filePath, String newSheetName, Map<String, Integer> dataMap) throws IOException {
+	        try (FileInputStream fileInputStream = new FileInputStream(filePath);
+	             Workbook workbook = new XSSFWorkbook(fileInputStream)) {
+
+	            // Create a new sheet in the workbook
+	            Sheet newSheet = workbook.createSheet(newSheetName);
+
+	            // Iterate over the data map and set values to the new sheet
+	            int rowNum = 0;
+	            for (Map.Entry<String, Integer> entry : dataMap.entrySet()) {
+	                Row row = newSheet.createRow(rowNum++);
+	                Cell keyCell = row.createCell(0);
+	                Cell valueCell = row.createCell(1);
+
+	                keyCell.setCellValue(entry.getKey());
+	                valueCell.setCellValue(entry.getValue());
+	            }
+
+	            // Write the changes back to the Excel file
+	            try (FileOutputStream fileOutputStream = new FileOutputStream(filePath)) {
+	                workbook.write(fileOutputStream);
+	            }
+	        }
+	    }
+	  private Map<String,String> getDefaultValues(List<String> columnNames,Connection con) throws SQLException{
+		  Map<String,String> defaultValue = new LinkedHashMap<>();
+		  Statement stmt=con.createStatement();
+		  ResultSet rs=null;
+		//  String columnList = String.join(",", columnNames);
+		  String columnList = columnNames.stream()
+	                .collect(Collectors.joining("','", "'", "'"));
+		  String query="select picklistName,defaultValue from DEFAULT_VALUES where picklistName in ("+columnList+")";
+		  System.out.println("Default value Query : "+query);
+		  rs=stmt.executeQuery(query);
+		  while(rs.next())
+		  {
+			  defaultValue.put(rs.getString("picklistName"), rs.getString("defaultValue"));
+		  }
+		  ConnectionUtils.closeConnection(rs, stmt, null);
+		  return defaultValue;
+	  }
+	  
+	  private Map<String,String> getMultiValueColumns(List<String> columnNames,Connection con) throws SQLException{
+		  Map<String,String> defaultValue = new LinkedHashMap<>();
+		  Statement stmt=con.createStatement();
+		  ResultSet rs=null;
+		  String columnList = columnNames.stream()
+	                .collect(Collectors.joining("','", "'", "'"));
+		  String query="select picklistName,delimiter from MULTI_VALUES where picklistName in ("+columnList+")";
+		  System.out.println("Default value Query : "+query);
+		  rs=stmt.executeQuery(query);
+		  while(rs.next())
+		  {
+			  defaultValue.put(rs.getString("picklistName"), rs.getString("delimiter"));
+		  }
+		  ConnectionUtils.closeConnection(rs, stmt, null);
+		  return defaultValue;
+	  }
+	  private String getPickListLabel(String colName, String picklistValue,Map<String,Map<String,String>> pickListObject)
+	  {
+		  String label=picklistValue;
+		  if(null!=pickListObject.get(colName)&& null!= pickListObject.get(colName) && null!= pickListObject.get(colName).get(picklistValue)) {
+			  label = pickListObject.get(colName).get(picklistValue);
+      	}
+		  return label;
+	  }
+	  public String getReportTableName(String profileName, String objectName,String dateTime) {
+			return profileName + "_"+objectName+"_"+dateTime;
+		}
+	  private List<String> getLongTextFields(String objectName,Connection con) throws SQLException {
+		  List<String> longTextFields = new ArrayList<>();
+		  Statement stmt=con.createStatement();
+		  ResultSet rs=null;
+		  String query="SELECT distinct(nameObj) FROM TARGET_OBJ_FIELDS WHERE ObjectName='"+objectName+"' and type='LongText'";
+		  System.out.println("Default value Query : "+query);
+		  rs=stmt.executeQuery(query);
+		  while(rs.next())
+		  {
+			  longTextFields.add(rs.getString("nameObj"));
+		  }
+		  ConnectionUtils.closeConnection(rs, stmt, null);
+		  return longTextFields;
+		}
+}
+	
