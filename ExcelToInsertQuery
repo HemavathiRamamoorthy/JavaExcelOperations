@@ -1,0 +1,77 @@
+package com.hema.excel.query;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+/**   Reads header and values from excel file and creates insert table script 
+**/
+public class ExcelToInsertQuery {
+    public static void main(String[] args) {
+    	 String filePath = "C:\\Download\\DataMapping.xlsx"; // Replace with the actual path to your Excel file
+         String tableName = "datamapping"; // Replace with the actual table name
+
+        try (FileInputStream fileInputStream = new FileInputStream(filePath);
+             Workbook workbook = new XSSFWorkbook(fileInputStream)) {
+
+            Sheet sheet = workbook.getSheetAt(0); // Assuming the data is in the first sheet
+
+            Row headerRow = sheet.getRow(0);
+            int columnCount = headerRow.getLastCellNum();
+
+            for (int i = 1; i <= sheet.getLastRowNum(); i++) {
+                Row row = sheet.getRow(i);
+
+                StringBuilder queryBuilder = new StringBuilder();
+                queryBuilder.append("INSERT INTO ").append(tableName).append(" (");
+
+                // Build column names in the query
+                for (int j = 0; j < columnCount; j++) {
+                    Cell cell = headerRow.getCell(j, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                    String columnName = cell != null ? cell.getStringCellValue() : "COLUMN_" + (j + 1);
+                    queryBuilder.append(columnName);
+
+                    if (j < columnCount - 1) {
+                        queryBuilder.append(", ");
+                    }
+                }
+
+                queryBuilder.append(") VALUES (");
+
+                // Build values in the query
+                for (int j = 0; j < columnCount; j++) {
+                    Cell cell = row.getCell(j, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+
+                    if (cell != null) {
+                        CellType cellType = cell.getCellType();
+                        switch (cellType) {
+                            case NUMERIC:
+                                queryBuilder.append(cell.getNumericCellValue());
+                                break;
+                            case STRING:
+                                queryBuilder.append("'").append(cell.getStringCellValue()).append("'");
+                                break;
+                            // Add more cases if you have other cell types to handle
+                            default:
+                                queryBuilder.append("NULL");
+                                break;
+                        }
+                    } else {
+                        queryBuilder.append("NULL");
+                    }
+
+                    if (j < columnCount - 1) {
+                        queryBuilder.append(", ");
+                    }
+                }
+
+                queryBuilder.append(")");
+
+                System.out.println(queryBuilder.toString()); // Print the generated insert query
+            }
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
